@@ -81,6 +81,7 @@ std::vector<uint8_t> bech32_address_decode(const std::string& addr)
 inline
 phase4::output_t create_plot(	const int k,
 								const int port,
+								const bool make_unique,
 								const int num_threads,
 								const int log_num_buckets,
 								const int log_num_buckets_3,
@@ -165,9 +166,20 @@ phase4::output_t create_plot(	const int k,
 			const auto plot_bytes = plot_key.Serialize();
 			bytes.insert(bytes.end(), plot_bytes.begin(), plot_bytes.end());
 		}
+		if(make_unique) {
+			std::vector<uint8_t> tmp(32 + 4);
+			bls::Util::Hash256(tmp.data(), bytes.data(), bytes.size());
+			const uint32_t port_u32 = port;
+			::memcpy(tmp.data() + 32, &port_u32, 4);
+			bytes = tmp;
+		}
 		bls::Util::Hash256(params.id.data(), bytes.data(), bytes.size());
 	}
-	const std::string plot_name = "plot-k" + std::to_string(k) + "-" + get_date_string_ex("%Y-%m-%d-%H-%M")
+	std::string prefix = "plot";
+	switch(port) {
+		case 11337: prefix += "-mmx"; break;
+	}
+	const std::string plot_name = prefix + "-k" + std::to_string(k) + "-" + get_date_string_ex("%Y-%m-%d-%H-%M")
 			+ "-" + bls::Util::HexStr(params.id.data(), params.id.size());
 	
 	std::cout << "Working Directory:   " << (tmp_dir.empty() ? "$PWD" : tmp_dir) << std::endl;
@@ -205,7 +217,7 @@ phase4::output_t create_plot(	const int k,
 }
 
 
-int _main(int argc, char** argv)
+int main(int argc, char** argv)
 {
 
 	cxxopts::Options options("chia_plot",
@@ -221,6 +233,7 @@ int _main(int argc, char** argv)
 		"Combined (tmpdir + tmpdir2) peak disk usage is less than 256 GiB.\n"
 		"In case of <count> != 1, you may press Ctrl-C for graceful termination after current plot is finished,\n"
 		"or double press Ctrl-C to terminate immediately.\n\n"
+		"(Sponsored by Flexpool.io - Check them out if you're looking for a secure and scalable Chia pool)\n"
 	);
 	
 	std::string pool_key_str;
@@ -229,6 +242,7 @@ int _main(int argc, char** argv)
 	std::string tmp_dir;
 	std::string tmp_dir2;
 	std::string final_dir;
+	std::string stage_dir;
 	int k = 32;
 	int port = 8444;			// 8444 = chia, 9699 = chives
 	int num_plots = 1;
@@ -238,23 +252,26 @@ int _main(int argc, char** argv)
 	bool waitforcopy = false;
 	bool tmptoggle = false;
 	bool directout = false;
+	bool make_unique = false;
 	
 	options.allow_unrecognised_options().add_options()(
 		"k, size", "K size (default = 32, k <= " + std::to_string(KMAX) + ")", cxxopts::value<int>(k))(
-		"x, port", "Network port (default = 8444, chives = 9699)", cxxopts::value<int>(port))(
+		"x, port", "Network port (default = 8444, chives = 9699, mmx = 11337)", cxxopts::value<int>(port))(
 		"n, count", "Number of plots to create (default = 1, -1 = infinite)", cxxopts::value<int>(num_plots))(
 		"r, threads", "Number of threads (default = 4)", cxxopts::value<int>(num_threads))(
 		"u, buckets", "Number of buckets (default = 256)", cxxopts::value<int>(num_buckets))(
 		"v, buckets3", "Number of buckets for phase 3+4 (default = buckets)", cxxopts::value<int>(num_buckets_3))(
 		"t, tmpdir", "Temporary directory, needs ~220 GiB (default = $PWD)", cxxopts::value<std::string>(tmp_dir))(
 		"2, tmpdir2", "Temporary directory 2, needs ~110 GiB [RAM] (default = <tmpdir>)", cxxopts::value<std::string>(tmp_dir2))(
-		"d, finaldir", "Final directory (default = <tmpdir>)", cxxopts::value<std::string>(final_dir))(
+		"d, finaldir", "Final directory to copy plot in parallel (default = <tmpdir>)", cxxopts::value<std::string>(final_dir))(
+		"s, stagedir", "Stage directory to write plot file (default = <tmpdir>)", cxxopts::value<std::string>(stage_dir))(
 		"w, waitforcopy", "Wait for copy to start next plot", cxxopts::value<bool>(waitforcopy))(
 		"p, poolkey", "Pool Public Key (48 bytes)", cxxopts::value<std::string>(pool_key_str))(
 		"c, contract", "Pool Contract Address (62 chars)", cxxopts::value<std::string>(contract_addr_str))(
 		"f, farmerkey", "Farmer Public Key (48 bytes)", cxxopts::value<std::string>(farmer_key_str))(
 		"G, tmptoggle", "Alternate tmpdir/tmpdir2 (default = false)", cxxopts::value<bool>(tmptoggle))(
 		"D, directout", "Create plot directly in finaldir (default = false)", cxxopts::value<bool>(directout))(
+		"Z, unique", "Make unique plot (default = false)", cxxopts::value<bool>(make_unique))(
 		"K, rmulti2", "Thread multiplier for P2 (default = 1)", cxxopts::value<int>(phase2::g_thread_multi))(
 		"version", "Print version")(
 		"help", "Print help");
@@ -299,8 +316,22 @@ int _main(int argc, char** argv)
 	if(final_dir.empty()) {
 		final_dir = tmp_dir;
 	}
+	if(!stage_dir.empty() && tmptoggle) {
+		std::cout << "Stagedir and tmptoggle are mutually exclusive options." << std::endl;
+		return -2;
+	}
+	if(!stage_dir.empty() && stage_dir.find_last_of("/\\") != stage_dir.size() - 1) {
+		std::cout << "Invalid stagedir: " << stage_dir << " (needs trailing '/' or '\\')" << std::endl;
+		return -2;
+	}
+	if(stage_dir.empty()) {
+		stage_dir = tmp_dir;
+	}
 	if(num_buckets_3 <= 0) {
 		num_buckets_3 = num_buckets;
+	}
+	switch(port) {
+		case 11337: make_unique = true; break;
 	}
 	std::vector<uint8_t> pool_key;
 	std::vector<uint8_t> puzzle_hash;
@@ -361,7 +392,7 @@ int _main(int argc, char** argv)
 	}
 	{
 		const std::string path = tmp_dir + ".chia_plot_tmp";
-		if(auto file = FOPEN(path.c_str(), "wb")) {
+		if(auto file = fopen(path.c_str(), "wb")) {
 			fclose(file);
 			remove(path.c_str());
 		} else {
@@ -371,7 +402,7 @@ int _main(int argc, char** argv)
 	}
 	{
 		const std::string path = tmp_dir2 + ".chia_plot_tmp2";
-		if(auto file = FOPEN(path.c_str(), "wb")) {
+		if(auto file = fopen(path.c_str(), "wb")) {
 			fclose(file);
 			remove(path.c_str());
 		} else {
@@ -381,7 +412,7 @@ int _main(int argc, char** argv)
 	}
 	{
 		const std::string path = final_dir + ".chia_plot_final";
-		if(auto file = FOPEN(path.c_str(), "wb")) {
+		if(auto file = fopen(path.c_str(), "wb")) {
 			fclose(file);
 			remove(path.c_str());
 		} else {
@@ -389,11 +420,19 @@ int _main(int argc, char** argv)
 			return -2;
 		}
 	}
+	{
+		const std::string path = stage_dir + ".chia_plot_final";
+		if(auto file = fopen(path.c_str(), "wb")) {
+			fclose(file);
+			remove(path.c_str());
+		} else {
+			std::cout << "Failed to write to stagedir directory: '" << stage_dir << "'" << std::endl;
+			return -2;
+		}
+	}
 	const int num_files_max = (1 << std::max(log_num_buckets, log_num_buckets_3)) + 2 * num_threads + 32;
 	
-#ifdef _WIN32
-	_setmaxstdio(num_files_max + 10);
-#else
+#ifndef _WIN32
 	if(false) {
 		// try to increase the open file limit
 		::rlimit the_limit;
@@ -410,7 +449,7 @@ int _main(int argc, char** argv)
 		std::vector<std::pair<FILE*, std::string>> files;
 		for(int i = 0; i < num_files_max; ++i) {
 			const std::string path = tmp_dir + ".chia_plot_tmp." + std::to_string(i);
-			if(auto file = FOPEN(path.c_str(), "wb")) {
+			if(auto file = fopen(path.c_str(), "wb")) {
 				files.emplace_back(file, path);
 			} else {
 				std::cout << "Cannot open at least " << num_files_max
@@ -452,8 +491,21 @@ int _main(int argc, char** argv)
 		std::cout << " - " << GIT_COMMIT_HASH;
 	#endif	
 	std::cout << std::endl;
-	std::cout << "Network Port: " << port << std::endl;
+	std::cout << "(Sponsored by Flexpool.io - Check them out if you're looking for a secure and scalable Chia pool)" << std::endl << std::endl;
+	std::cout << "Network Port: " << port;
+	switch(port) {
+		case 8444: std::cout << " [chia]"; break;
+		case 9699: std::cout << " [chives]"; break;
+		case 11337: std::cout << " [MMX]"; break;
+	}
+	if(make_unique) {
+		std::cout << " (unique)";
+	}
+	std::cout << std::endl;
 	std::cout << "Final Directory: " << final_dir << std::endl;
+	if (final_dir != stage_dir) {
+		std::cout << "Stage Directory: " << stage_dir << std::endl;
+	}
 	if(num_plots >= 0) {
 		std::cout << "Number of Plots: " << num_plots << std::endl;
 	} else {
@@ -491,10 +543,10 @@ int _main(int argc, char** argv)
 		std::cout << "Crafting plot " << i+1 << " out of " << num_plots
 				<< " (" << get_date_string_ex("%Y/%m/%d %H:%M:%S") << ")" << std::endl;
 		const auto out = create_plot(
-				k, port, num_threads, log_num_buckets, log_num_buckets_3,
-				pool_key, puzzle_hash, farmer_key, tmp_dir, tmp_dir2, directout ? final_dir : tmp_dir);
+				k, port, make_unique, num_threads, log_num_buckets, log_num_buckets_3,
+				pool_key, puzzle_hash, farmer_key, tmp_dir, tmp_dir2, directout ? final_dir : stage_dir);
 		
-		if(final_dir != tmp_dir)
+		if(final_dir != stage_dir)
 		{
 			if(!directout) {
 				const auto dst_path = final_dir + out.params.plot_name + ".plot";
@@ -516,38 +568,3 @@ int _main(int argc, char** argv)
 	
 	return 0;
 }
-
-#ifdef _WIN32
-
-void handle_eptr(std::exception_ptr eptr)
-{
-	try {
-		if (eptr) {
-			std::rethrow_exception(eptr);
-		}
-	}
-	catch (const std::exception& e) {
-		std::cout << "Caught exception \"" << e.what() << "\"\n";
-	}
-}
-
-int main(int argc, char** argv)
-{
-	std::exception_ptr eptr;
-	try {
-		return _main(argc, argv);
-	}
-	catch (...) {
-		eptr = std::current_exception();
-	}
-	handle_eptr(eptr);
-}
-
-#else
-
-int main(int argc, char** argv)
-{
-	return _main(argc, argv);
-}
-
-#endif /* _WIN32 */
